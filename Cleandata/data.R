@@ -42,3 +42,18 @@ startups_clean <- raw_startups |>
 
 # 3) Quick check
 glimpse(startups_clean)
+
+#plots
+
+startups_clean |>
+  mutate(
+    ipo = factor(ipo, levels = c("no", "yes")),
+    acquired = factor(acquired, levels = c("no", "yes"))
+  ) |>
+  pivot_longer(c(ipo, acquired), names_to = "outcome", values_to = "value") |>
+  ggplot(aes(x = value)) +
+  geom_bar() +
+  facet_wrap(~ outcome) +
+  theme_minimal() +
+  labs(title = "IPO and Acquisition Counts", x = NULL, y = "Count")
+
