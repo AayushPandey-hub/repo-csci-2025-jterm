@@ -1,0 +1,218 @@
+library(shiny)
+library(bslib)
+library(shinycssloaders)
+library(tidyverse)
+library(janitor)
+library(lubridate)
+
+# ----------------------------
+# 1) Load + clean data
+# ----------------------------
+startups_raw <- read_csv("data/raw/startups.csv", show_col_types = FALSE) |> 
+  clean_names()
+
+# --- Try to standardize common column names across Kaggle datasets ---
+# Adjust these mappings after you glance at names(startups_raw)
+startups <- startups_raw |>
+  mutate(
+    status = coalesce(status, company_status, market_status) |> tolower(),
+    founded_year = coalesce(founded_year, founded, year_founded),
+    category = coalesce(category, category_list, industry, sector),
+    country = coalesce(country, country_code, country_name),
+    total_funding_usd = coalesce(total_funding_usd, funding_total_usd, total_funding)
+  ) |>
+  mutate(
+    founded_year = as.integer(founded_year),
+    total_funding_usd = suppressWarnings(as.numeric(total_funding_usd)),
+    success = if_else(status %in% c("ipo", "acquired"), 1L, 0L)
+  ) |>
+  filter(!is.na(founded_year)) |>
+  mutate(
+    founded_decade = paste0(floor(founded_year/10)*10, "s"),
+    category = fct_lump_n(as.factor(category), n = 20, other_level = "Other"),
+    country = fct_lump_n(as.factor(country), n = 20, other_level = "Other")
+  )
+
+# ----------------------------
+# 2) UI
+# ----------------------------
+ui <- fluidPage(
+  theme = bs_theme(version = 5, bootswatch = "flatly"),
+  titlePanel("Startup Success Dashboard"),
+
+  navlistPanel(
+    id = "tabs",
+
+    tabPanel(
+      "Explore",
+      fluidRow(
+        column(4,
+          sliderInput("year_rng", "Founded year range:",
+                      min = min(startups$founded_year, na.rm = TRUE),
+                      max = max(startups$founded_year, na.rm = TRUE),
+                      value = c(max(min(startups$founded_year, na.rm = TRUE), 2000),
+                                max(startups$founded_year, na.rm = TRUE)),
+                      step = 1, sep = ""),
+          selectInput("cat", "Category:", choices = c("All", levels(startups$category)), selected = "All"),
+          selectInput("ctry", "Country:", choices = c("All", levels(startups$country)), selected = "All"),
+          selectInput("yvar", "Y variable:",
+                      choices = c("Success rate" = "success_rate",
+                                  "Count of startups" = "n",
+                                  "Median funding (USD)" = "median_funding")),
+          selectInput("xvar", "Group by:",
+                      choices = c("Category" = "category",
+                                  "Country" = "country",
+                                  "Founded decade" = "founded_decade"))
+        ),
+        column(8,
+          withSpinner(plotOutput("explore_plot", height = 420))
+        )
+      )
+    ),
+
+    tabPanel(
+      "Trends",
+      fluidRow(
+        column(4,
+          selectInput("trend_group", "Trend by:",
+                      choices = c("Category" = "category", "Country" = "country")),
+          sliderInput("trend_year_rng", "Years:",
+                      min = min(startups$founded_year, na.rm = TRUE),
+                      max = max(startups$founded_year, na.rm = TRUE),
+                      value = c(2005, max(startups$founded_year, na.rm = TRUE)),
+                      step = 1, sep = "")
+        ),
+        column(8,
+          withSpinner(plotOutput("trend_plot", height = 420))
+        )
+      )
+    ),
+
+    tabPanel(
+      "Model",
+      fluidRow(
+        column(4,
+          helpText("This predicts success = IPO/Acquired using a simple logistic regression."),
+          selectInput("m_category", "Category:", choices = levels(startups$category)),
+          selectInput("m_country", "Country:", choices = levels(startups$country)),
+          numericInput("m_founded_year", "Founded year:", value = 2018,
+                       min = min(startups$founded_year, na.rm = TRUE),
+                       max = max(startups$founded_year, na.rm = TRUE)),
+          numericInput("m_funding", "Total funding (USD):", value = 5e6, min = 0, step = 1e6)
+        ),
+        column(8,
+          h4("Predicted probability of success"),
+          verbatimTextOutput("pred_out"),
+          withSpinner(plotOutput("model_diag", height = 320))
+        )
+      )
+    )
+  )
+)
+
+# ----------------------------
+# 3) Server
+# ----------------------------
+server <- function(input, output, session) {
+
+  filtered <- reactive({
+    d <- startups |>
+      filter(between(founded_year, input$year_rng[1], input$year_rng[2]))
+
+    if (input$cat != "All") d <- d |> filter(category == input$cat)
+    if (input$ctry != "All") d <- d |> filter(country == input$ctry)
+
+    d
+  })
+
+  explore_summary <- reactive({
+    group_col <- sym(input$xvar)
+
+    filtered() |>
+      group_by(!!group_col) |>
+      summarise(
+        n = n(),
+        success_rate = mean(success, na.rm = TRUE),
+        median_funding = median(total_funding_usd, na.rm = TRUE),
+        .groups = "drop"
+      ) |>
+      arrange(desc(n))
+  })
+
+  output$explore_plot <- renderPlot({
+    d <- explore_summary()
+    y <- sym(input$yvar)
+    x <- sym(input$xvar)
+
+    ggplot(d, aes(x = !!x, y = !!y)) +
+      geom_col() +
+      coord_flip() +
+      theme_minimal() +
+      labs(x = NULL, y = NULL)
+  })
+
+  output$trend_plot <- renderPlot({
+    d <- startups |>
+      filter(between(founded_year, input$trend_year_rng[1], input$trend_year_rng[2])) |>
+      group_by(founded_year, .data[[input$trend_group]]) |>
+      summarise(success_rate = mean(success, na.rm = TRUE), n = n(), .groups = "drop") |>
+      filter(n >= 10)  # avoid noisy tiny groups
+
+    ggplot(d, aes(x = founded_year, y = success_rate, group = .data[[input$trend_group]])) +
+      geom_line(alpha = 0.4) +
+      theme_minimal() +
+      labs(x = "Founded year", y = "Success rate (IPO/Acquired)")
+  })
+
+  # ---- Simple model (logistic regression) ----
+  model_fit <- reactive({
+    d <- startups |>
+      filter(!is.na(total_funding_usd)) |>
+      mutate(log_funding = log1p(total_funding_usd)) |>
+      select(success, founded_year, category, country, log_funding)
+
+    glm(success ~ founded_year + log_funding + category + country,
+        data = d, family = binomial())
+  })
+
+  output$pred_out <- renderText({
+    m <- model_fit()
+
+    newdata <- tibble(
+      founded_year = as.integer(input$m_founded_year),
+      log_funding = log1p(as.numeric(input$m_funding)),
+      category = factor(input$m_category, levels = levels(startups$category)),
+      country = factor(input$m_country, levels = levels(startups$country))
+    )
+
+    p <- predict(m, newdata = newdata, type = "response")
+    paste0("Predicted success probability: ", round(p * 100, 1), "%")
+  })
+
+  output$model_diag <- renderPlot({
+    m <- model_fit()
+    # quick calibration-ish view: predicted vs actual bins
+    d <- startups |>
+      filter(!is.na(total_funding_usd)) |>
+      mutate(log_funding = log1p(total_funding_usd))
+
+    d$phat <- predict(m, newdata = d, type = "response")
+
+    binned <- d |>
+      mutate(bin = ntile(phat, 10)) |>
+      group_by(bin) |>
+      summarise(
+        mean_phat = mean(phat),
+        actual = mean(success),
+        .groups = "drop"
+      )
+
+    ggplot(binned, aes(x = mean_phat, y = actual)) +
+      geom_point(size = 3) +
+      geom_abline(intercept = 0, slope = 1) +
+      theme_minimal() +
+      labs(x = "Predicted (binned)", y = "Actual success rate")
+  })
+}
+
+shinyApp(ui, server)
